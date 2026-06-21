@@ -683,22 +683,30 @@ def _diff_databases(old_db: Path, new_db: Path, db_name: str,
             new_cols = {c["name"] for c in new_schema["columns"]}
             comparable = old_cols & new_cols
 
-            # 选 key：以 new 的主键/rowid 为准（若主键相同则优先）
-            try:
-                key_cols = table_key_cols(n, t)
-                # 老库上用相同 key 能否拉？
-                o.execute(
-                    f"SELECT {','.join('\"'+k+'\"' for k in key_cols)} FROM \"{t}\" LIMIT 1"
-                )
-            except sqlite3.OperationalError:
-                # 不可比，只记结构差异
-                patch_entry["rows"] = {"skipped": True, "reason": "key/rowid 不可对齐"}
-                table_patches[t] = patch_entry
-                continue
+            # 选 key：优先新主键，若新主键列在旧表不全有 → 尝试旧主键
+            old_schema_cols = {c["name"] for c in old_schema["columns"]}
+            new_schema_cols = {c["name"] for c in new_schema["columns"]}
+
+            key_cols = table_key_cols(n, t)
+            all_in_old = all(k in old_schema_cols for k in key_cols)
+
+            if not all_in_old:
+                # 新主键在旧表不全有 → 尝试旧主键
+                old_key_cols = table_key_cols(o, t)
+                all_in_new = all(k in new_schema_cols for k in old_key_cols)
+                if all_in_new:
+                    key_cols = old_key_cols
+                else:
+                    # 无法对齐，只记结构差异
+                    patch_entry["rows"] = {"skipped": True, "reason": "key 列在两库中不对齐"}
+                    table_patches[t] = patch_entry
+                    continue
 
             old_rows = fetch_all_rows(o, t, key_cols)
             new_rows = fetch_all_rows(n, t, key_cols)
-            rows_patch = _row_patch(old_rows, new_rows, comparable, key_cols)
+            new_only_cols = sorted(new_cols - old_cols)
+            rows_patch = _row_patch(old_rows, new_rows, comparable, key_cols,
+                                    new_only_cols=new_only_cols)
             patch_entry["rows"] = rows_patch
             added_rows += rows_patch["added_count"]
             removed_rows += rows_patch["removed_count"]
@@ -789,14 +797,27 @@ def _schema_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
         "added": added,
         "removed": removed,
         "modified": modified,
+        "new_columns": new["columns"],
+        "old_columns": old["columns"],
+        "new_create_sql": new.get("create_sql"),
+        "old_create_sql": old.get("create_sql"),
     }
 
 
 def _row_patch(old: "OrderedDict[Tuple, Dict]", new: "OrderedDict[Tuple, Dict]",
-               comparable: set, key_cols: List[str]) -> Dict[str, Any]:
+               comparable: set, key_cols: List[str],
+               new_only_cols: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    生成行级 patch。
+    comparable: 两表共有的列名集合
+    new_only_cols: 仅新表有、旧表没有的列（结构新增列）。
+                    如果 new_only_cols 非空，所有公共行都会出现在 modified 中，
+    里包含这些新列的值（old=None 表示从无到有）。
+    """
     added_keys = set(new) - set(old)
     removed_keys = set(old) - set(new)
     common_keys = set(old) & set(new)
+    new_only = new_only_cols or []
     added = []
     removed = []
     modified = []
@@ -811,11 +832,15 @@ def _row_patch(old: "OrderedDict[Tuple, Dict]", new: "OrderedDict[Tuple, Dict]",
             a, b = ov.get(col), nv.get(col)
             if _jsonable(a) != _jsonable(b):
                 field_diff[col] = {"old": _jsonable(a), "new": _jsonable(b)}
+        # 新增列：所有公共行都记录新值（old 侧不存在，记为 null）
+        for col in sorted(new_only):
+            field_diff[col] = {"old": None, "new": _jsonable(nv.get(col))}
         if field_diff:
             modified.append({"key": list(k), "fields": field_diff})
     return {
         "skipped": False,
         "key_columns": key_cols,
+        "new_only_columns": new_only,
         "added": added,
         "removed": removed,
         "modified": modified,
@@ -1042,15 +1067,28 @@ def _apply_snapshot_file(payload: Dict[str, Any], target: Path,
                 plan["added_rows"] += rows.get("added_count", 0)
                 continue
 
-            # 公共表：先应用 schema 修改（仅简单支持加列/删列/改列类型）
+            # 公共表
             if schema.get("changed"):
-                _apply_schema_changes(conn, t, schema)
-            # 应用行变更
-            if not rows.get("skipped"):
-                r = _apply_row_patch(conn, t, rows)
-                plan["added_rows"] += r["added"]
-                plan["removed_rows"] += r["removed"]
-                plan["modified_rows"] += r["modified"]
+                # 有结构变化：分三阶段
+                # 0) 先保存旧索引（loose 重建会丢索引）
+                old_indexes = _get_table_indexes(conn, t)
+                # 1) 宽松版重建：所有列可空、无主键约束，先把数据迁过去
+                _rebuild_table_loose(conn, t, schema)
+                # 2) 应用行 patch（此时新增列会被填上精确值）
+                if not rows.get("skipped"):
+                    r = _apply_row_patch(conn, t, rows)
+                    plan["added_rows"] += r["added"]
+                    plan["removed_rows"] += r["removed"]
+                    plan["modified_rows"] += r["modified"]
+                # 3) 严格版重建：加回 NOT NULL、主键约束，重建索引
+                _rebuild_table_strict(conn, t, schema, old_indexes)
+            else:
+                # 无结构变化，直接应用行变更
+                if not rows.get("skipped"):
+                    r = _apply_row_patch(conn, t, rows)
+                    plan["added_rows"] += r["added"]
+                    plan["removed_rows"] += r["removed"]
+                    plan["modified_rows"] += r["modified"]
         conn.commit()
         conn.execute("PRAGMA foreign_keys = ON")
     return plan
@@ -1099,27 +1137,213 @@ def _normalize_default(raw: Any) -> str:
     return s
 
 
-def _apply_schema_changes(conn: sqlite3.Connection, table: str, schema: Dict[str, Any]) -> None:
-    # 简单策略：新增列 ALTER TABLE ADD；删除/修改列走 12 步重建（这里仅实现新增列，复杂重建提示）
-    for c in schema.get("added", []):
-        sql = f'ALTER TABLE "{table}" ADD COLUMN "{c["name"]}" {c["type"] or "TEXT"}'
-        if c.get("notnull"):
-            # 加 NOT NULL 需要 default，避免失败
-            if c.get("default") is None:
-                default_val = "''" if "TEXT" in (c["type"] or "TEXT").upper() else "0"
-                sql += f" DEFAULT {default_val}"
-            else:
-                sql += f" DEFAULT {_normalize_default(c['default'])}"
-        if c.get("default") is not None and not c.get("notnull"):
-            sql += f" DEFAULT {_normalize_default(c['default'])}"
-        try:
-            conn.execute(sql)
-        except sqlite3.OperationalError as e:
-            print(f"    [!] 无法自动添加列 {c['name']} 到 {table}: {e}", file=sys.stderr)
+def _rebuild_table_loose(conn: sqlite3.Connection, table: str, schema: Dict[str, Any]) -> None:
+    """
+    第一阶段重建：将旧表改造成「宽松版」新结构。
+    宽松 = 所有列可空、无主键约束。目的：先把列对齐，允许迁移数据。
+    """
+    # 读取旧列（用于数据迁移）
+    cur = conn.execute(f'PRAGMA table_info("{table}")')
+    old_cols = [{"name": r[1], "type": r[2], "notnull": bool(r[3]),
+                 "default": r[4], "pk": int(r[5] or 0)} for r in cur.fetchall()]
+    old_col_names = {c["name"] for c in old_cols}
 
-    if schema.get("removed") or schema.get("modified"):
-        print(f"    [i] 表 {table} 存在删除/修改列，未自动重建（需要手动迁移）",
-              file=sys.stderr)
+    # 目标新列（完整定义）
+    new_columns = schema["new_columns"]
+    new_col_names = {c["name"] for c in new_columns}
+
+    # 仅新增列，无删除/修改/主键变化 → 用 ALTER TABLE ADD 更快
+    only_add = (not schema.get("removed")) and (not schema.get("modified")) \
+               and schema.get("primary_keys_old") == schema.get("primary_keys_new")
+    if only_add:
+        for c in schema.get("added", []):
+            sql = f'ALTER TABLE "{table}" ADD COLUMN "{c["name"]}" {c["type"] or "TEXT"}'
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as e:
+                print(f"    [!] 无法添加列 {c['name']} 到 {table}: {e}", file=sys.stderr)
+        return
+
+    # 需要重建：宽松版（所有列可空，无主键）
+    loose_cols = [dict(c, notnull=False, pk=0) for c in new_columns]
+    common = [c["name"] for c in new_columns if c["name"] in old_col_names]
+
+    _do_rebuild_table(conn, table, loose_cols, pks=[], keep_data_cols=common)
+
+
+def _rebuild_table_strict(conn: sqlite3.Connection, table: str, schema: Dict[str, Any],
+                          old_indexes: Optional[List[Tuple[str, str]]] = None) -> None:
+    """
+    第二阶段重建：将宽松版表改造成「严格版」——加上 NOT NULL、主键约束，重建索引。
+    如果有完整 new_create_sql，则优先使用（保留所有约束如 UNIQUE/CHECK 等）。
+    """
+    new_columns = schema["new_columns"]
+    new_pks = schema["primary_keys_new"]
+    new_create_sql = schema.get("new_create_sql")
+
+    if old_indexes is None:
+        old_indexes = _get_table_indexes(conn, table)
+    cur_col_names = [c["name"] for c in new_columns]
+
+    _do_rebuild_table(conn, table, new_columns, pks=new_pks,
+                      keep_data_cols=cur_col_names, indexes=old_indexes,
+                      create_sql=new_create_sql)
+
+
+def _do_rebuild_table(conn: sqlite3.Connection, table: str,
+                      columns: List[Dict], pks: List[str],
+                      keep_data_cols: Optional[List[str]] = None,
+                      indexes: Optional[List[Tuple[str, str]]] = None,
+                      create_sql: Optional[str] = None) -> None:
+    """
+    通用表重建：用指定列/主键重建 table，迁移 keep_data_cols 的数据，最后重建索引。
+    如果提供 create_sql（完整 CREATE TABLE 语句），则优先用它建表（更准确保留约束）。
+    """
+    if keep_data_cols is None:
+        keep_data_cols = [c["name"] for c in columns]
+    if indexes is None:
+        indexes = []
+
+    tmp_name = f"__tmp_rebuild_{table}"
+    conn.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
+
+    # 建新表
+    if create_sql:
+        # 替换表名为临时表名：CREATE TABLE "oldname" (...) → CREATE TABLE "tmp_name" (...)
+        # 用正则替换第一个出现的表名
+        tmp_create_sql = re.sub(
+            r'(?i)CREATE\s+TABLE\s+(?:"|\')?\w+(?:"|\')?',
+            f'CREATE TABLE "{tmp_name}"',
+            create_sql, count=1
+        )
+        conn.execute(tmp_create_sql)
+    else:
+        ddl = _build_create_table_ddl(tmp_name, columns, pks)
+        conn.execute(ddl)
+
+    # 迁移数据
+    if keep_data_cols:
+        col_list = ",".join(f'"{c}"' for c in keep_data_cols)
+        conn.execute(f'INSERT INTO "{tmp_name}" ({col_list}) SELECT {col_list} FROM "{table}"')
+
+    # 替换
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{table}"')
+
+    # 重建索引
+    col_names_set = {c["name"] for c in columns}
+    for idx_name, idx_sql in indexes:
+        idx_cols_set = _extract_index_columns(idx_sql)
+        if idx_cols_set and not idx_cols_set.issubset(col_names_set):
+            print(f"    [i] 索引 {idx_name} 引用已删除列，跳过重建", file=sys.stderr)
+            continue
+        try:
+            conn.execute(idx_sql)
+        except sqlite3.OperationalError as e:
+            print(f"    [!] 重建索引 {idx_name} 失败: {e}", file=sys.stderr)
+
+
+def _compute_new_columns(old_cols: List[Dict], schema: Dict[str, Any]) -> Tuple[List[Dict], List[str]]:
+    """根据旧列 + schema patch 计算新列定义和主键。"""
+    removed = {c["name"] for c in schema.get("removed", [])}
+    modified = {c["name"]: c["changes"] for c in schema.get("modified", [])}
+    added_list = schema.get("added", [])
+    added_map = {c["name"]: c for c in added_list}
+    new_pks_old = schema.get("primary_keys_old", [])
+    new_pks_new = schema.get("primary_keys_new", [])
+
+    new_cols: List[Dict] = []
+
+    # 处理旧列（保留/修改/删除）
+    for c in old_cols:
+        name = c["name"]
+        if name in removed:
+            continue
+        col = dict(c)
+        if name in modified:
+            changes = modified[name]
+            for k, v in changes.items():
+                if k == "type":
+                    col["type"] = v["new"]
+                elif k == "notnull":
+                    col["notnull"] = v["new"]
+                elif k == "default":
+                    col["default"] = v["new"]
+                elif k == "pk":
+                    col["pk"] = v["new"]
+        # 如果 added 里也有同名列（说明是"新增列在当前阶段已经存在"，以 added 的最新定义为准）
+        if name in added_map:
+            for k, v in added_map[name].items():
+                if k == "pk":
+                    col[k] = int(v or 0)
+                elif k == "notnull":
+                    col[k] = bool(v)
+                else:
+                    col[k] = v
+            del added_map[name]
+        new_cols.append(col)
+
+    # 加上真正新增的列（added_map 剩下的就是旧表没有的）
+    for c in added_list:
+        if c["name"] in added_map:
+            new_cols.append(dict(c))
+
+    # 重排 pk 字段值，使之与 primary_keys_new 顺序一致
+    pk_names = list(new_pks_new) if new_pks_new else []
+    for i, pname in enumerate(pk_names, start=1):
+        for c in new_cols:
+            if c["name"] == pname:
+                c["pk"] = i
+                break
+    # 不在新主键里的列，pk=0
+    if pk_names:
+        for c in new_cols:
+            if c["name"] not in pk_names:
+                c["pk"] = 0
+
+    return new_cols, pk_names
+
+
+def _build_create_table_ddl(table_name: str, columns: List[Dict], pks: List[str]) -> str:
+    """根据列定义+主键列表生成 CREATE TABLE DDL。"""
+    col_sqls = []
+    for c in columns:
+        s = f'"{c["name"]}" {c["type"] or "TEXT"}'
+        if c.get("notnull"):
+            s += " NOT NULL"
+        if c.get("default") is not None:
+            s += f" DEFAULT {_normalize_default(c['default'])}"
+        # 单列主键且是 INTEGER + pk=1 时写成 PRIMARY KEY（带 autoincrement 效果）
+        # 这里统一走表级 PRIMARY KEY 约束，更稳妥
+        col_sqls.append(s)
+
+    if pks:
+        pk_list = ",".join(f'"{p}"' for p in pks)
+        col_sqls.append(f"PRIMARY KEY ({pk_list})")
+
+    return f'CREATE TABLE "{table_name}" ({", ".join(col_sqls)})'
+
+
+def _get_table_indexes(conn: sqlite3.Connection, table: str) -> List[Tuple[str, str]]:
+    """返回 [(index_name, create_sql), ...]，自动排除 sqlite_autoindex_ 开头的。"""
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=?", (table,)
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows if r[1] and not r[0].startswith("sqlite_autoindex_")]
+
+
+def _extract_index_columns(idx_sql: str) -> Optional[set]:
+    """简单解析 CREATE INDEX ... ON table(col1, col2, ...) 返回列名集合。"""
+    m = re.search(r"\(([^)]+)\)", idx_sql)
+    if not m:
+        return None
+    cols = []
+    for part in m.group(1).split(","):
+        part = part.strip().strip('"').strip("'")
+        # 去掉 ASC/DESC
+        part = re.sub(r"\s+(ASC|DESC)$", "", part, flags=re.IGNORECASE).strip()
+        cols.append(part)
+    return set(cols)
 
 
 def _apply_row_patch(conn: sqlite3.Connection, table: str, rows: Dict[str, Any]) -> Dict[str, int]:

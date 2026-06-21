@@ -10,3 +10,5 @@ _e2e_test.py
 _mutate.py
 _mutate2.py
 .DS_Store
+
+_schema_test.py
