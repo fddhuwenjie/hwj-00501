@@ -1,0 +1,12 @@
+.sqlite_backups/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+*.pre_restore_*
+diff_report.md
+_debug.py
+_e2e_test.py
+_mutate.py
+_mutate2.py
+.DS_Store
