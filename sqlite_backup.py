@@ -223,6 +223,561 @@ class Store:
             return json.load(f)
 
 
+# ----------------------------- Doctor 健康诊断 ----------------------------- #
+
+class Issue:
+    """表示一个诊断问题。"""
+    def __init__(self, severity: str, code: str, message: str,
+                 affected_id: Optional[str] = None, suggestion: str = "",
+                 details: Optional[Dict[str, Any]] = None):
+        self.severity = severity  # "error" or "warning"
+        self.code = code
+        self.message = message
+        self.affected_id = affected_id
+        self.suggestion = suggestion
+        self.details = details or {}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "affected_id": self.affected_id,
+            "suggestion": self.suggestion,
+            "details": self.details,
+        }
+
+
+class Doctor:
+    """备份仓库与恢复链路健康诊断器。"""
+
+    def __init__(self, store: Store, target_db: Optional[Path] = None):
+        self.store = store
+        self.target_db = target_db
+        self.issues: List[Issue] = []
+        self.check_count = 0
+        self._index_valid = True
+
+    def run_all(self) -> Dict[str, Any]:
+        """执行所有诊断检查。"""
+        self.issues = []
+        self.check_count = 0
+        self._index_valid = True
+
+        self._check_index_integrity()
+        if self._index_valid:
+            self._check_backups()
+            self._check_snapshots()
+        if self.target_db is not None:
+            self._check_target_database()
+
+        return self._build_report()
+
+    def _add_issue(self, severity: str, code: str, message: str,
+                   affected_id: Optional[str] = None, suggestion: str = "",
+                   details: Optional[Dict[str, Any]] = None) -> None:
+        self.issues.append(Issue(severity, code, message, affected_id, suggestion, details))
+
+    def _incr_check(self) -> None:
+        self.check_count += 1
+
+    # ---- index.json 检查 ----
+    def _check_index_integrity(self) -> None:
+        self._incr_check()
+        try:
+            idx = self.store._read_index()
+        except json.JSONDecodeError as e:
+            self._add_issue(
+                "error", "INDEX_CORRUPTED",
+                f"index.json 格式损坏: {e}",
+                suggestion="手动修复 index.json 或从最近的备份恢复"
+            )
+            self._index_valid = False
+            return
+        except OSError as e:
+            self._add_issue(
+                "error", "INDEX_UNREADABLE",
+                f"index.json 无法读取: {e}",
+                suggestion="检查文件权限或恢复 index.json"
+            )
+            self._index_valid = False
+            return
+
+        self._incr_check()
+        for key in ("backups", "snapshots"):
+            if key not in idx:
+                self._add_issue(
+                    "error", "INDEX_MISSING_KEY",
+                    f"index.json 缺少 '{key}' 字段",
+                    suggestion="手动添加缺失的字段或重新初始化仓库"
+                )
+
+        self._incr_check()
+        backups = idx.get("backups", {})
+        snapshots = idx.get("snapshots", {})
+
+        for bid, bmeta in backups.items():
+            self._incr_check()
+            for f in ("id", "created_at", "manifest_path"):
+                if f not in bmeta:
+                    self._add_issue(
+                        "error", "BACKUP_META_MISSING_FIELD",
+                        f"备份 {bid} 的索引元数据缺少 '{f}' 字段",
+                        affected_id=bid,
+                        suggestion="手动补全字段或删除该备份记录"
+                    )
+
+        for sid, smeta in snapshots.items():
+            self._incr_check()
+            for f in ("id", "created_at", "snapshot_path"):
+                if f not in smeta:
+                    self._add_issue(
+                        "error", "SNAPSHOT_META_MISSING_FIELD",
+                        f"快照 {sid} 的索引元数据缺少 '{f}' 字段",
+                        affected_id=sid,
+                        suggestion="手动补全字段或删除该快照记录"
+                    )
+
+    # ---- 备份检查 ----
+    def _check_backups(self) -> None:
+        idx = self.store._read_index()
+        backups = idx.get("backups", {})
+
+        for bid, bmeta in backups.items():
+            self._check_backup_file(bid, bmeta)
+
+    def _check_backup_file(self, bid: str, bmeta: Dict[str, Any]) -> None:
+        manifest_path = self.store.root / bmeta.get("manifest_path", "")
+
+        self._incr_check()
+        if not manifest_path.exists():
+            self._add_issue(
+                "error", "BACKUP_MANIFEST_MISSING",
+                f"备份 {bid} 的 manifest.json 不存在: {manifest_path}",
+                affected_id=bid,
+                suggestion="重新创建备份或手动恢复 manifest 文件"
+            )
+            return
+
+        self._incr_check()
+        try:
+            manifest = self.store.load_backup_manifest(bid)
+        except json.JSONDecodeError as e:
+            self._add_issue(
+                "error", "BACKUP_MANIFEST_CORRUPTED",
+                f"备份 {bid} 的 manifest.json 格式损坏: {e}",
+                affected_id=bid,
+                suggestion="重新创建备份或手动修复 JSON 格式"
+            )
+            return
+        except Exception as e:
+            self._add_issue(
+                "error", "BACKUP_MANIFEST_UNREADABLE",
+                f"备份 {bid} 的 manifest.json 无法读取: {e}",
+                affected_id=bid,
+                suggestion="检查文件权限"
+            )
+            return
+
+        backup_file = manifest_path.parent / manifest.get("file_name", "")
+
+        self._incr_check()
+        if not backup_file.exists():
+            self._add_issue(
+                "error", "BACKUP_FILE_MISSING",
+                f"备份 {bid} 的数据文件不存在: {backup_file}",
+                affected_id=bid,
+                suggestion="重新创建备份"
+            )
+            return
+
+        self._incr_check()
+        expected_sha = manifest.get("sha256")
+        if expected_sha:
+            actual_sha = sha256_file(backup_file)
+            if actual_sha != expected_sha:
+                self._add_issue(
+                    "error", "BACKUP_CHECKSUM_MISMATCH",
+                    f"备份 {bid} 的 SHA256 校验不匹配: 期望 {expected_sha[:16]}..., 实际 {actual_sha[:16]}...",
+                    affected_id=bid,
+                    suggestion="该备份已损坏, 请勿使用, 建议删除并重新备份",
+                    details={"expected": expected_sha, "actual": actual_sha}
+                )
+
+        self._incr_check()
+        if manifest.get("compressed") or is_gzip(backup_file):
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td) / "test.db"
+                    gzip_decompress(backup_file, tmp)
+            except Exception as e:
+                self._add_issue(
+                    "error", "BACKUP_GZIP_CORRUPTED",
+                    f"备份 {bid} 的 gzip 压缩文件无法解压: {e}",
+                    affected_id=bid,
+                    suggestion="该备份已损坏, 无法用于恢复, 建议重新备份"
+                )
+                return
+        else:
+            tmp = backup_file
+
+        self._incr_check()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                if manifest.get("compressed"):
+                    test_db = Path(td) / "test.db"
+                    gzip_decompress(backup_file, test_db)
+                else:
+                    test_db = backup_file
+
+                if not safe_exists_db(test_db):
+                    self._add_issue(
+                        "error", "BACKUP_NOT_SQLITE",
+                        f"备份 {bid} 的内容不是有效的 SQLite 文件",
+                        affected_id=bid,
+                        suggestion="该备份已损坏, 无法用于恢复"
+                    )
+                    return
+
+                with closing(connect_readonly(test_db)) as conn:
+                    bad = pragma_integrity_check(conn)
+                    self._incr_check()
+                    if bad:
+                        self._add_issue(
+                            "error", "BACKUP_INTEGRITY_FAILED",
+                            f"备份 {bid} 的 SQLite 完整性检查失败: {bad}",
+                            affected_id=bid,
+                            suggestion="该备份数据库已损坏, 不建议用于恢复"
+                        )
+
+                    stats = get_db_stats(conn)
+                    expected_stats = manifest.get("stats", {})
+
+                    self._incr_check()
+                    expected_tables = set(expected_stats.get("tables", []))
+                    actual_tables = set(stats.get("tables", []))
+                    if expected_tables and expected_tables != actual_tables:
+                        missing = expected_tables - actual_tables
+                        extra = actual_tables - expected_tables
+                        self._add_issue(
+                            "warning", "BACKUP_SCHEMA_MISMATCH",
+                            f"备份 {bid} 的表结构与记录不一致: 缺失 {sorted(missing)}, 多余 {sorted(extra)}",
+                            affected_id=bid,
+                            suggestion="可能是 manifest 记录过时, 建议重新备份以更新元数据",
+                            details={"expected_tables": sorted(expected_tables),
+                                     "actual_tables": sorted(actual_tables)}
+                        )
+
+                    self._incr_check()
+                    expected_rows = expected_stats.get("total_rows")
+                    actual_rows = stats.get("total_rows")
+                    if expected_rows is not None and expected_rows != actual_rows:
+                        self._add_issue(
+                            "warning", "BACKUP_ROW_COUNT_MISMATCH",
+                            f"备份 {bid} 的行数与记录不一致: 期望 {expected_rows}, 实际 {actual_rows}",
+                            affected_id=bid,
+                            suggestion="可能是 manifest 记录过时, 建议重新备份",
+                            details={"expected_rows": expected_rows, "actual_rows": actual_rows}
+                        )
+        except Exception as e:
+            self._add_issue(
+                "error", "BACKUP_INSPECTION_FAILED",
+                f"备份 {bid} 检查过程中出错: {e}",
+                affected_id=bid,
+                suggestion="检查备份文件是否可读"
+            )
+
+    # ---- 快照检查 ----
+    def _check_snapshots(self) -> None:
+        idx = self.store._read_index()
+        snapshots = idx.get("snapshots", {})
+        backups = idx.get("backups", {})
+
+        for sid, smeta in snapshots.items():
+            self._check_snapshot_file(sid, smeta, backups, snapshots)
+
+        self._check_snapshot_chains(snapshots, backups)
+
+    def _check_snapshot_file(self, sid: str, smeta: Dict[str, Any],
+                             backups: Dict[str, Any], snapshots: Dict[str, Any]) -> None:
+        snap_path = self.store.root / smeta.get("snapshot_path", "")
+
+        self._incr_check()
+        if not snap_path.exists():
+            self._add_issue(
+                "error", "SNAPSHOT_FILE_MISSING",
+                f"快照 {sid} 的 snapshot.json 不存在: {snap_path}",
+                affected_id=sid,
+                suggestion="重新创建该快照或从依赖链中移除"
+            )
+            return
+
+        self._incr_check()
+        try:
+            payload = self.store.load_snapshot(sid)
+        except json.JSONDecodeError as e:
+            self._add_issue(
+                "error", "SNAPSHOT_JSON_CORRUPTED",
+                f"快照 {sid} 的 JSON 格式损坏: {e}",
+                affected_id=sid,
+                suggestion="重新创建该快照"
+            )
+            return
+        except Exception as e:
+            self._add_issue(
+                "error", "SNAPSHOT_UNREADABLE",
+                f"快照 {sid} 无法读取: {e}",
+                affected_id=sid,
+                suggestion="检查文件权限"
+            )
+            return
+
+        base_backup = smeta.get("base_backup")
+        self._incr_check()
+        if base_backup and base_backup not in backups:
+            self._add_issue(
+                "error", "SNAPSHOT_BASE_MISSING",
+                f"快照 {sid} 依赖的基准备份 {base_backup} 不存在",
+                affected_id=sid,
+                suggestion="恢复基准备份或重建该快照链"
+            )
+
+        parent = smeta.get("parent")
+        self._incr_check()
+        if parent:
+            if parent.startswith("sn_") and parent not in snapshots:
+                self._add_issue(
+                    "error", "SNAPSHOT_PARENT_MISSING",
+                    f"快照 {sid} 依赖的父快照 {parent} 不存在",
+                    affected_id=sid,
+                    suggestion="恢复父快照或重建该快照链"
+                )
+            elif parent.startswith("bk_") and parent not in backups:
+                self._add_issue(
+                    "error", "SNAPSHOT_PARENT_BACKUP_MISSING",
+                    f"快照 {sid} 依赖的父备份 {parent} 不存在",
+                    affected_id=sid,
+                    suggestion="恢复父备份或重建该快照"
+                )
+
+    def _check_snapshot_chains(self, snapshots: Dict[str, Any], backups: Dict[str, Any]) -> None:
+        for sid in snapshots:
+            self._check_snapshot_chain(sid, snapshots, backups)
+
+    def _check_snapshot_chain(self, start_sid: str, snapshots: Dict[str, Any],
+                              backups: Dict[str, Any]) -> None:
+        visited = set()
+        chain: List[str] = []
+        cur = start_sid
+
+        while True:
+            self._incr_check()
+            if cur in visited:
+                self._add_issue(
+                    "error", "SNAPSHOT_CHAIN_CYCLE",
+                    f"快照链存在环: {' -> '.join(chain + [cur])}",
+                    affected_id=start_sid,
+                    suggestion="手动修复快照的 parent 引用"
+                )
+                return
+
+            visited.add(cur)
+            chain.append(cur)
+
+            smeta = snapshots.get(cur)
+            if not smeta:
+                break
+
+            parent = smeta.get("parent")
+            if not parent:
+                self._add_issue(
+                    "warning", "SNAPSHOT_NO_PARENT",
+                    f"快照 {cur} 没有 parent 引用",
+                    affected_id=cur,
+                    suggestion="检查快照是否正确关联到基准备份或父快照"
+                )
+                break
+
+            if parent.startswith("bk_"):
+                if parent not in backups:
+                    self._add_issue(
+                        "error", "SNAPSHOT_CHAIN_BASE_MISSING",
+                        f"快照链 {start_sid} 最终依赖的备份 {parent} 不存在, 链断裂",
+                        affected_id=start_sid,
+                        suggestion="恢复基准备份或重建快照链"
+                    )
+                break
+
+            if parent.startswith("sn_"):
+                if parent not in snapshots:
+                    self._add_issue(
+                        "error", "SNAPSHOT_CHAIN_BROKEN",
+                        f"快照链在 {cur} -> {parent} 处断裂, 完整链: {' -> '.join(chain)}",
+                        affected_id=start_sid,
+                        suggestion="恢复缺失的快照 {parent} 或重建该链"
+                    )
+                    break
+                cur = parent
+            else:
+                self._add_issue(
+                    "error", "SNAPSHOT_INVALID_PARENT",
+                    f"快照 {cur} 的 parent 格式无效: {parent}",
+                    affected_id=cur,
+                    suggestion="手动修复 parent 为有效的 bk_ 或 sn_ ID"
+                )
+                break
+
+    # ---- 目标数据库检查 ----
+    def _check_target_database(self) -> None:
+        db_path = self.target_db
+
+        self._incr_check()
+        if not db_path.exists():
+            self._add_issue(
+                "error", "TARGET_DB_MISSING",
+                f"目标数据库不存在: {db_path}",
+                suggestion="确认路径是否正确"
+            )
+            return
+
+        self._incr_check()
+        if not safe_exists_db(db_path):
+            self._add_issue(
+                "error", "TARGET_DB_NOT_SQLITE",
+                f"目标数据库不是有效的 SQLite 文件: {db_path}",
+                suggestion="确认文件是否为 SQLite 3 格式"
+            )
+            return
+
+        self._incr_check()
+        try:
+            with closing(connect_readonly(db_path)) as conn:
+                bad = pragma_integrity_check(conn)
+                if bad:
+                    self._add_issue(
+                        "error", "TARGET_DB_INTEGRITY_FAILED",
+                        f"目标数据库完整性检查失败: {bad}",
+                        suggestion="使用 sqlite3 .recover 尝试恢复或从备份恢复"
+                    )
+
+                actual_stats = get_db_stats(conn)
+                actual_tables = set(actual_stats.get("tables", []))
+
+                if self._index_valid:
+                    idx = self.store._read_index()
+                    backups = idx.get("backups", {})
+                    snapshots = idx.get("snapshots", {})
+
+                    checked_backups = set()
+
+                    for sid, smeta in snapshots.items():
+                        if smeta.get("db_name") == db_path.name:
+                            base_backup = smeta.get("base_backup")
+                            if base_backup and base_backup in backups and base_backup not in checked_backups:
+                                checked_backups.add(base_backup)
+                                self._check_target_vs_backup(conn, base_backup, actual_tables)
+
+                    for bid, bmeta in backups.items():
+                        if bid in checked_backups:
+                            continue
+                        try:
+                            manifest = self.store.load_backup_manifest(bid)
+                            if manifest.get("original_name") == db_path.name:
+                                self._check_target_vs_backup(conn, bid, actual_tables)
+                                break
+                        except Exception:
+                            continue
+        except Exception as e:
+            self._add_issue(
+                "error", "TARGET_DB_INSPECTION_FAILED",
+                f"目标数据库检查出错: {e}",
+                suggestion="检查文件权限和完整性"
+            )
+
+    def _check_target_vs_backup(self, conn: sqlite3.Connection, bid: str, actual_tables: set) -> None:
+        self._incr_check()
+        try:
+            manifest = self.store.load_backup_manifest(bid)
+            expected_stats = manifest.get("stats", {})
+            expected_tables = set(expected_stats.get("tables", []))
+
+            if expected_tables:
+                missing_in_target = expected_tables - actual_tables
+                extra_in_target = actual_tables - expected_tables
+                if missing_in_target:
+                    self._add_issue(
+                        "warning", "TARGET_DB_SCHEMA_MISMATCH",
+                        f"目标数据库相比基准备份 {bid} 缺失表: {sorted(missing_in_target)}",
+                        suggestion="可能是未应用的快照包含这些表, 请检查快照链"
+                    )
+                if extra_in_target:
+                    self._add_issue(
+                        "warning", "TARGET_DB_EXTRA_TABLES",
+                        f"目标数据库相比基准备份 {bid} 有多余表: {sorted(extra_in_target)}",
+                        suggestion="确认这些表是否为预期的新增表"
+                    )
+        except Exception:
+            pass
+
+    # ---- 报告生成 ----
+    def _build_report(self) -> Dict[str, Any]:
+        errors = [i for i in self.issues if i.severity == "error"]
+        warnings = [i for i in self.issues if i.severity == "warning"]
+        affected_ids = sorted(set(i.affected_id for i in self.issues if i.affected_id))
+
+        return {
+            "summary": {
+                "total_checks": self.check_count,
+                "errors": len(errors),
+                "warnings": len(warnings),
+                "total_issues": len(self.issues),
+                "affected_ids": affected_ids,
+            },
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+
+def render_doctor_report(report: Dict[str, Any], json_output: bool = False) -> str:
+    """渲染 doctor 诊断报告。"""
+    if json_output:
+        return json.dumps(report, ensure_ascii=False, indent=2)
+
+    lines = []
+    s = report["summary"]
+    issues = report["issues"]
+
+    status = "PASS" if s["errors"] == 0 and s["warnings"] == 0 else \
+             "WARN" if s["errors"] == 0 else "FAIL"
+
+    lines.append("=" * 60)
+    lines.append(f"  SQLite 备份仓库健康诊断报告 - {status}")
+    lines.append("=" * 60)
+    lines.append(f"  总检查数: {s['total_checks']}")
+    lines.append(f"  错误数:   {s['errors']}")
+    lines.append(f"  警告数:   {s['warnings']}")
+    lines.append(f"  受影响 ID: {', '.join(s['affected_ids']) if s['affected_ids'] else '(无)'}")
+    lines.append("")
+
+    if not issues:
+        lines.append("[✓] 未发现任何问题, 备份仓库状态良好")
+        return "\n".join(lines)
+
+    lines.append("-" * 60)
+    lines.append("  问题详情")
+    lines.append("-" * 60)
+
+    for i, issue in enumerate(issues, 1):
+        severity_tag = "[ERROR]" if issue["severity"] == "error" else "[WARN]"
+        lines.append(f"\n{i}. {severity_tag} {issue['code']}")
+        if issue["affected_id"]:
+            lines.append(f"   受影响: {issue['affected_id']}")
+        lines.append(f"   原因: {issue['message']}")
+        if issue["suggestion"]:
+            lines.append(f"   建议: {issue['suggestion']}")
+
+    return "\n".join(lines)
+
+
 # --------------------------- SQLite 结构与数据工具 --------------------------- #
 
 def list_tables(conn: sqlite3.Connection) -> List[str]:
@@ -1873,6 +2428,27 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+# -------------------------------- doctor -------------------------------- #
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    store = Store(Path(args.store))
+    target_db = Path(args.target) if args.target else None
+
+    doctor = Doctor(store, target_db)
+    report = doctor.run_all()
+
+    output = render_doctor_report(report, json_output=args.json)
+    print(output)
+
+    errors = report["summary"]["errors"]
+    warnings = report["summary"]["warnings"]
+
+    if args.strict:
+        return 1 if (errors > 0 or warnings > 0) else 0
+    else:
+        return 1 if errors > 0 else 0
+
+
 # ------------------------------- CLI 入口 ------------------------------- #
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1948,6 +2524,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--keep-weekly", type=int, default=4, help="每个 db 每周保留 N 周（默认 4）")
     s.add_argument("--yes", action="store_true", help="无需交互确认直接执行删除")
     s.set_defaults(func=cmd_prune)
+
+    # doctor
+    s = sub.add_parser("doctor", help="健康诊断：检查备份仓库和恢复链路可用性")
+    s.add_argument("--target", default=None, help="可选：目标数据库路径，用于检查 schema 一致性")
+    s.add_argument("--json", action="store_true", help="以 JSON 格式输出诊断结果")
+    s.add_argument("--strict", action="store_true", help="存在 warning 时也返回非零退出码")
+    s.set_defaults(func=cmd_doctor)
 
     return p
 
